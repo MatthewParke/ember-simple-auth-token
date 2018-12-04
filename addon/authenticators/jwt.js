@@ -49,6 +49,8 @@ export default TokenAuthenticator.extend({
     this.tokenExpirationInvalidateSession = conf.tokenExpirationInvalidateSession === false ? false : true;
     this.serverTokenRefreshEndpoint = conf.serverTokenRefreshEndpoint || '/api/token-refresh/';
     this.refreshTokenPropertyName = conf.refreshTokenPropertyName || 'refresh_token';
+    this.reattemptRefresh = conf.reattemptRefresh === true ? true : false;
+		this.reattemptRefreshDelay = conf.reattemptRefreshDelay || 10;
     this.tokenExpireName = conf.tokenExpireName || 'exp';
     this.refreshLeeway = conf.refreshLeeway || 0;
   },
@@ -167,7 +169,7 @@ export default TokenAuthenticator.extend({
         if (wait > 0) {
           cancel(this._refreshTokenTimeout);
           delete this._refreshTokenTimeout;
-          this._refreshTokenTimeout = later(this, this.refreshAccessToken, refreshToken, wait);
+          this._refreshTokenTimeout = later(this, this.refreshAccessToken, refreshToken, {}, expiresAt, wait);
         } else if (expiresAt > now) {
           throw new Error('refreshLeeway is too large which is preventing token refresh.');
         }
@@ -189,7 +191,7 @@ export default TokenAuthenticator.extend({
     @method refreshAccessToken
     @private
   */
-  refreshAccessToken(token) {
+  refreshAccessToken(token, headers, expiresAt) {
     const data = this.makeRefreshData(token);
 
     return this.makeRequest(this.serverTokenRefreshEndpoint, data, this.headers)
@@ -199,7 +201,7 @@ export default TokenAuthenticator.extend({
         return sessionData;
       })
       .catch(error => {
-        this.handleTokenRefreshFail(error.status);
+        this.handleTokenRefreshFail(error.status, token, headers, expiresAt);
         return Promise.reject(error);
       });
   },
@@ -309,11 +311,19 @@ export default TokenAuthenticator.extend({
     Handles token refresh fail status. If the server response to a token refresh has a
     status of 401 or 403 then the token in the session will be invalidated and
     the sessionInvalidated provided by ember-simple-auth will be triggered.
+    If reattemptRefresh is turned on then after a defined delay the refresh will be
+    reattemped so long as the token is still active.
 
     @method handleTokenRefreshFail
   */
 
-  handleTokenRefreshFail(refreshStatus) {
+  handleTokenRefreshFail(refreshStatus, refreshToken, headers, expiresAt) {
+    if (this.reattemptRefresh && this.reattemptRefreshDelay && refreshToken && expiresAt) {
+      let delay = this.reattemptRefreshDelay * 1000;
+      Ember.run.later(this, this.reattemptAccessTokenRefresh, refreshToken, headers, expiresAt, delay);
+      return new Ember.RSVP.resolve();
+    }
+
     if (refreshStatus === 401 || refreshStatus === 403) {
       return this.invalidate().then(() => {
         this.trigger('sessionDataInvalidated');
@@ -321,6 +331,23 @@ export default TokenAuthenticator.extend({
     }
   },
 
+  /**
+    Handles reattempting to refresh the access token if there is still time before
+    the token expires, otherwise it will invalidate the token.
+
+    @method reattemptAccessTokenRefresh
+  */
+
+	reattemptAccessTokenRefresh(refreshToken, headers, expiresAt) {
+		const now = this.getCurrentTime();
+		if (expiresAt > now) {
+			return this.refreshAccessToken(refreshToken, headers, expiresAt);
+		}
+		return this.invalidate().then(() => {
+			this.trigger('sessionDataInvalidated');
+		});
+  },
+  
   /**
     Schedules session invalidation at the time token expires.
 
